@@ -1,0 +1,834 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h> 
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <time.h>
+#include <ThreeWire.h>
+#include <RtcDS1302.h>
+#include <ArduinoJson.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <Preferences.h>
+
+
+const char* ssid = "Rumah Kebun"; 
+const char* password = "Agrifam2024"; 
+
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 7 * 3600; 
+const int   daylightOffset_sec = 0;
+
+ThreeWire myWire(18,19,23);
+RtcDS1302<ThreeWire> Rtc(myWire);
+
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+const char* mqtt_server = "broker.avisha.id"; 
+const int   mqtt_port = 8883;
+const char* client_id = "esp32_penerima_lcd"; 
+const char* mqtt_user = "ezramnd";  
+const char* mqtt_pass = "kqvUj@FRXw2lKFU"; 
+
+const char* topic_sync_request = "ezramnd/sync/request";
+const char* topicSensorDataSub = "ezramnd/climate/esp32/alat/94-3C-C6-4E-66-E4/data";
+
+String macAddress;
+String topicPrefix;
+String topicClimateJadwalSet;
+String topicClimateSettingsSet;
+String topicClimateManualSet;
+String topicClimateStatusSet;
+String topicClimateModeSet;
+String topicClimateJadwalGet;
+
+
+#define KIPAS_1_PIN 25
+#define KIPAS_2_PIN 26
+
+WiFiClientSecure espClient; 
+PubSubClient client(espClient);
+Preferences preferences;
+
+volatile float temp_diterima = 0.0;
+volatile float hum_diterima = 0.0;
+const unsigned long timeoutDuration = 30000; 
+unsigned long lastPacketTime = 0; 
+bool isConnected = false; 
+int displayMode = 0; 
+unsigned long lastLcdUpdateTime = 0;    
+const unsigned long lcdUpdateInterval = 1000; 
+unsigned int screenChangeCounter = 0;   
+const unsigned int screenChangeInterval = 5; 
+bool forceLcdClear = true; 
+bool kipas1_State = false; 
+bool kipas2_State = false; 
+
+unsigned long lastReconnectAttempt = 0;
+const unsigned long reconnectInterval = 5000;
+unsigned long lastWifiReconnectAttempt = 0;
+const unsigned long wifiReconnectInterval = 60000;
+unsigned long lastNtpSync = 0;
+const unsigned long ntpSyncInterval = 43200000UL;
+
+bool isNotifActive = false;
+unsigned long notifEndTime = 0;
+String notifLine1 = "";
+String notifLine2 = "";
+
+struct ClimateSettings {
+  float kipas1_min; 
+  float kipas1_max;
+  float kipas2_min;
+  float kipas2_max;
+} climateSettings;
+
+#define MAX_CLIMATE_SCHEDULES 10
+#define MAX_WAKTU_PER_SCHEDULE 5
+
+struct ClimateSchedule {
+  int id;
+  char tanggalMulai[11];
+  char tanggalSelesai[11];
+  char waktu[MAX_WAKTU_PER_SCHEDULE][6];
+  int waktuCount = 0;
+  int durasi = 0;
+  bool fans[3] = {false, false, false};
+};
+ClimateSchedule climateSchedules[MAX_CLIMATE_SCHEDULES];
+int climateScheduleCount = 0;
+
+unsigned long kipas1_stopTime = 0;
+unsigned long kipas2_stopTime = 0;
+bool kipas1_on_by_schedule = false;
+bool kipas2_on_by_schedule = false;
+static unsigned long lastScheduleCheck = 0;
+
+const unsigned long stableTime = 5000;
+unsigned long kipas1_lastChangeTime = 0;
+unsigned long kipas2_lastChangeTime = 0;
+String controlMode = "auto";
+
+typedef struct struct_message {
+  float suhu;
+  float kelembaban;
+} struct_message;
+
+struct_message dataSensorMasuk;
+
+unsigned long lastDataPublish = 0;
+const unsigned long dataPublishInterval = 10000;
+
+void OnDataRecv(const esp_now_recv_info* recv_info, const uint8_t *incomingData, int len) {
+  memcpy(&dataSensorMasuk, incomingData, sizeof(dataSensorMasuk));
+  lastPacketTime = millis();
+
+  if (dataSensorMasuk.suhu <= -998.0) {
+    Serial.println("Menerima KODE ERROR SENSOR dari Pengirim!");
+    isConnected = true;
+    temp_diterima = 0.0;
+    hum_diterima = 0.0;
+    
+    triggerLcdNotification("SENSOR BERMASALAH!", "Cek ESP Pengirim", 5000);
+    forceLcdClear = true;
+    
+    if (!kipas1_on_by_schedule) setKipasState(1, false);
+    if (!kipas2_on_by_schedule) setKipasState(2, false);
+
+  } else {
+    temp_diterima = dataSensorMasuk.suhu;
+    hum_diterima = dataSensorMasuk.kelembaban;
+    isConnected = true; 
+  }
+}
+
+void triggerLcdNotification(String line1, String line2, int duration = 2000);
+
+void printTwoDigits(int number) { 
+  if (number < 10) { 
+    lcd.print("0"); 
+  } 
+  lcd.print(number); 
+}
+
+String getFormattedDate(const RtcDateTime& dt) {
+  char buf[11];
+  snprintf(buf, sizeof(buf), "%04u-%02u-%02u", dt.Year(), dt.Month(), dt.Day());
+  return String(buf);
+}
+
+String getFormattedTime(const RtcDateTime& dt) {
+  char buf[6];
+  snprintf(buf, sizeof(buf), "%02u:%02u", dt.Hour(), dt.Minute());
+  return String(buf);
+}
+
+
+void syncRtcWithNtp() {
+  Serial.println("Sinkronisasi RTC dengan NTP...");
+  lcd.clear(); lcd.print("Sync NTP...");
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    Rtc.SetDateTime(RtcDateTime(timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday, timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec));
+    Serial.println("Waktu NTP diterima & RTC disetel.");
+    lcd.clear(); lcd.print("RTC Sync OK!");
+    lastNtpSync = millis();
+  } else {
+    Serial.println("Gagal mendapatkan waktu NTP.");
+    lcd.clear(); lcd.print("NTP Fail!");
+  }
+  delay(1000);
+}
+
+void setKipasState(int kipasNum, bool state) {
+  unsigned long now = millis(); 
+
+  if (kipasNum == 1) {
+    if (kipas1_State == state) return; 
+    if (now - kipas1_lastChangeTime < stableTime) {
+      Serial.println("Kipas 1: Perintah ditolak (stable time aktif)");
+      return; 
+    }
+    kipas1_lastChangeTime = now; 
+    kipas1_State = state; 
+    digitalWrite(KIPAS_1_PIN, state ? HIGH : LOW); 
+
+  } else if (kipasNum == 2) {
+    if (kipas2_State == state) return; 
+    if (now - kipas2_lastChangeTime < stableTime) {
+      Serial.println("Kipas 2: Perintah ditolak (stable time aktif)");
+      return; 
+    }
+    kipas2_lastChangeTime = now; 
+    kipas2_State = state; 
+    digitalWrite(KIPAS_2_PIN, state ? HIGH : LOW); 
+  } else {
+    return; 
+  }
+
+  if (client.connected()) {
+    StaticJsonDocument<50> doc;
+    String kipasKey = (kipasNum == 1) ? "kipas1" : "kipas2";
+    String stateStr = state ? "ON" : "OFF";
+    doc[kipasKey] = stateStr;
+    
+    char jsonBuffer[50];
+    serializeJson(doc, jsonBuffer);
+    client.publish(topicClimateStatusSet.c_str(), jsonBuffer, true); 
+    Serial.printf("Kipas %d diatur %s (JSON dikirim)\n", kipasNum, stateStr.c_str());
+  } else {
+    Serial.printf("Kipas %d diatur %s (Offline)\n", kipasNum, state ? "ON" : "OFF");
+  }
+
+  forceLcdClear = true; 
+}
+
+void checkThresholds() {
+  if (temp_diterima == 0.0) return; 
+
+  if (!kipas1_on_by_schedule) {
+    if (temp_diterima >= climateSettings.kipas1_max) {
+      setKipasState(1, true);
+    } else if (temp_diterima <= climateSettings.kipas1_min) {
+      setKipasState(1, false);
+    }
+  }
+
+  if (!kipas2_on_by_schedule) {
+    if (temp_diterima >= climateSettings.kipas2_max) {
+      setKipasState(2, true);
+    } else if (temp_diterima <= climateSettings.kipas2_min) {
+      setKipasState(2, false);
+    }
+  }
+}
+
+void checkScheduleTimers() {
+  unsigned long now = millis();
+  if (kipas1_on_by_schedule && (now >= kipas1_stopTime)) {
+    Serial.println("Jadwal Kipas 1 selesai. Mematikan.");
+    kipas1_on_by_schedule = false;
+    kipas1_stopTime = 0;
+    setKipasState(1, false);
+  }
+  if (kipas2_on_by_schedule && (now >= kipas2_stopTime)) {
+    Serial.println("Jadwal Kipas 2 selesai. Mematikan.");
+    kipas2_on_by_schedule = false;
+    kipas2_stopTime = 0;
+    setKipasState(2, false);
+  }
+}
+
+void checkSchedules() {
+  unsigned long now = millis();
+  if (now - lastScheduleCheck < 60000) {
+    return;
+  }
+  lastScheduleCheck = now;
+
+  RtcDateTime rtcNow = Rtc.GetDateTime();
+  if (!rtcNow.IsValid() || rtcNow.Year() < 2025) {
+     Serial.println("Waktu RTC tidak valid, membatalkan cek jadwal.");
+     return;
+  }
+
+  String currentDate = getFormattedDate(rtcNow);
+  String currentTime = getFormattedTime(rtcNow);
+  Serial.printf("Mengecek jadwal untuk %s %s\n", currentDate.c_str(), currentTime.c_str());
+
+  for (int i = 0; i < climateScheduleCount; i++) {
+    ClimateSchedule& sched = climateSchedules[i];
+    if (currentDate.compareTo(sched.tanggalMulai) >= 0 && currentDate.compareTo(sched.tanggalSelesai) <= 0) {
+      for (int j = 0; j < sched.waktuCount; j++) {
+        if (currentTime.equals(sched.waktu[j])) {
+          Serial.printf("MEMICU JADWAL ID %d!\n", sched.id);
+          unsigned long stopTime = millis() + (sched.durasi * 60000UL); 
+
+          String fansStr = "";
+          if (sched.fans[1]) fansStr += "K1 ";
+          if (sched.fans[2]) fansStr += "K2";
+          if (fansStr == "") fansStr = "Tidak ada";
+          triggerLcdNotification("Jadwal Aktif:", fansStr);
+
+          if (sched.fans[1]) {
+            kipas1_on_by_schedule = true;
+            kipas1_stopTime = stopTime;
+            setKipasState(1, true);
+          }
+          if (sched.fans[2]) {
+            kipas2_on_by_schedule = true;
+            kipas2_stopTime = stopTime;
+            setKipasState(2, true);
+          }
+        }
+      }
+    }
+  }
+}
+
+void deleteClimateSchedule(int id) {
+  int foundIndex = -1;
+  for (int i = 0; i < climateScheduleCount; i++) {
+    if (climateSchedules[i].id == id) {
+      foundIndex = i;
+      break;
+    }
+  }
+
+  if (foundIndex != -1) {
+    Serial.printf("Menghapus jadwal ID %d\n", id);
+    for (int i = foundIndex; i < climateScheduleCount - 1; i++) {
+      climateSchedules[i] = climateSchedules[i + 1];
+    }
+    climateScheduleCount--;
+  }
+}
+
+void parseAndAddSchedule(JsonObject s) {
+  int id = s["id"];
+  int slot = -1;
+
+  for (int i = 0; i < climateScheduleCount; i++) {
+    if (climateSchedules[i].id == id) {
+      slot = i;
+      break;
+    }
+  }
+
+  if (slot == -1) {
+    if (climateScheduleCount >= MAX_CLIMATE_SCHEDULES) {
+      Serial.println("Kapasitas jadwal penuh!");
+      return;
+    }
+    slot = climateScheduleCount; 
+    climateScheduleCount++;
+  }
+
+  Serial.printf("Menyimpan jadwal ID %d di slot %d\n", id, slot);
+  ClimateSchedule& sched = climateSchedules[slot];
+  sched.id = id;
+  sched.durasi = s["durasi"] | 0;
+
+  strlcpy(sched.tanggalMulai, s["tanggalMulai"] | "2025-01-01", 11);
+  strlcpy(sched.tanggalSelesai, s["tanggalSelesai"] | "2099-12-31", 11);
+
+  JsonArray waktuArray = s["waktu"].as<JsonArray>();
+  sched.waktuCount = 0;
+  for (JsonVariant v : waktuArray) {
+    if (sched.waktuCount < MAX_WAKTU_PER_SCHEDULE) {
+      strlcpy(sched.waktu[sched.waktuCount], v.as<const char*>(), 6);
+      sched.waktuCount++;
+    }
+  }
+
+  sched.fans[1] = false;
+  sched.fans[2] = false;
+  JsonArray fansArray = s["fans"].as<JsonArray>();
+  for (JsonVariant v : fansArray) {
+    int fanNum = v.as<int>();
+    if (fanNum == 1) sched.fans[1] = true;
+    if (fanNum == 2) sched.fans[2] = true;
+  }
+}
+
+void triggerLcdNotification(String line1, String line2, int duration) {
+  notifLine1 = line1;
+  notifLine2 = line2;
+  notifEndTime = millis() + duration;
+  isNotifActive = true;
+  forceLcdClear = true;
+}
+
+void loadSettingsFromPreferences() {
+  Serial.println("Memuat pengaturan dari memori (Preferences)...");
+  
+  preferences.begin("climate-app", true); 
+  
+  controlMode = preferences.getString("ctrlMode", "auto"); 
+  Serial.print("Mode Kontrol dimuat: "); Serial.println(controlMode);
+
+  climateSettings.kipas1_min = preferences.getFloat("k1_min", 28.0);
+  climateSettings.kipas1_max = preferences.getFloat("k1_max", 30.0);
+  climateSettings.kipas2_min = preferences.getFloat("k2_min", 33.0);
+  climateSettings.kipas2_max = preferences.getFloat("k2_max", 35.0);
+
+  Serial.printf("Treshold dimuat: K1 (%.1f-%.1f C), K2 (%.1f-%.1f C)\n",
+    climateSettings.kipas1_min, climateSettings.kipas1_max,
+    climateSettings.kipas2_min, climateSettings.kipas2_max);
+    
+  preferences.end();
+}
+
+void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Pesan diterima [");
+  Serial.print(topic);
+  Serial.print("] ");
+  
+  String sTopic = String(topic);
+
+  if (sTopic.equals(topicSensorDataSub)) {
+     StaticJsonDocument<256> doc;
+     DeserializationError error = deserializeJson(doc, payload, length);
+
+     if (!error) {
+        float t = doc["suhu"];
+        float h = doc["kelembaban"];
+
+        if (t > -900.0) { 
+            temp_diterima = t;
+            hum_diterima = h;
+            
+            lastPacketTime = millis(); 
+            isConnected = true; 
+            
+            Serial.printf("[MQTT BRIDGE] Data Masuk: %.2f C, %.2f %%\n", temp_diterima, hum_diterima);
+            
+            forceLcdClear = true; 
+        } else {
+            Serial.println("[MQTT BRIDGE] Terima data error dari sensor");
+        }
+     } else {
+        Serial.println("[MQTT BRIDGE] Gagal parse JSON sensor");
+     }
+     return;
+  }
+
+  if (sTopic.equals(topicClimateModeSet)) {
+    StaticJsonDocument<100> doc;
+    deserializeJson(doc, payload, length);
+    const char* newMode = doc["mode"];
+
+    if (newMode) {
+      if (strcmp(newMode, "auto") == 0 || strcmp(newMode, "manual") == 0) {
+        controlMode = String(newMode);
+        Serial.println("Mode Kontrol diatur ke: " + controlMode);
+        triggerLcdNotification("Mode Diubah:", "Mode " + controlMode);
+
+        preferences.begin("climate-app", false);
+        preferences.putString("ctrlMode", controlMode);
+        preferences.end();
+        Serial.println("Mode baru disimpan ke Preferences.");
+        if (controlMode == "manual") {
+            Serial.println("Mode Manual: Mereset timer jadwal & mematikan kipas.");
+            kipas1_on_by_schedule = false;
+            kipas2_on_by_schedule = false;
+            kipas1_stopTime = 0;
+            kipas2_stopTime = 0;
+            setKipasState(1, false);
+            setKipasState(2, false);
+        }
+      }
+    }
+  }
+
+  else if (sTopic.equals(topicClimateManualSet)) {
+    if (controlMode != "manual") {
+      Serial.println("Perintah manual ditolak, mode bukan 'manual'");
+      return; 
+    }
+    StaticJsonDocument<100> doc;
+    deserializeJson(doc, payload, length);
+    const char* target = doc["target"]; 
+    const char* stateStr = doc["state"]; 
+    
+    Serial.printf("Perintah manual: %s -> %s\n", target, stateStr);
+    bool state = (strcmp(stateStr, "ON") == 0);
+
+    if (strcmp(target, "fan1") == 0) {
+      kipas1_on_by_schedule = false; 
+      kipas1_stopTime = 0;
+      setKipasState(1, state);
+    } else if (strcmp(target, "fan2") == 0) {
+      kipas2_on_by_schedule = false; 
+      kipas2_stopTime = 0;
+      setKipasState(2, state);
+    }
+  }
+  
+  else if (sTopic.equals(topicClimateSettingsSet)) {
+    StaticJsonDocument<200> doc;
+    deserializeJson(doc, payload, length);
+    
+    climateSettings.kipas1_min = doc["kipas1_min"] | climateSettings.kipas1_min;
+    climateSettings.kipas1_max = doc["kipas1_max"] | climateSettings.kipas1_max;
+    climateSettings.kipas2_min = doc["kipas2_min"] | climateSettings.kipas2_min;
+    climateSettings.kipas2_max = doc["kipas2_max"] | climateSettings.kipas2_max;
+    
+    Serial.println("Pengaturan Treshold Climate diperbarui.");
+
+    preferences.begin("climate-app", false);
+    preferences.putFloat("k1_min", climateSettings.kipas1_min);
+    preferences.putFloat("k1_max", climateSettings.kipas1_max);
+    preferences.putFloat("k2_min", climateSettings.kipas2_min);
+    preferences.putFloat("k2_max", climateSettings.kipas2_max);
+    preferences.end();
+    Serial.println("Treshold baru disimpan ke Preferences.");
+
+    char buf[17];
+    snprintf(buf, 17, "K1:%.0f-%.0f K2:%.0f-%.0f",
+             climateSettings.kipas1_min, climateSettings.kipas1_max,
+             climateSettings.kipas2_min, climateSettings.kipas2_max);
+    triggerLcdNotification("Set Point Baru:", buf);
+  }
+  
+  else if (sTopic.equals(topicClimateJadwalSet)) {
+    StaticJsonDocument<1024> doc; 
+    deserializeJson(doc, payload, length);
+    
+    const char* action = doc["action"];
+    Serial.printf("Perintah Jadwal: %s\n", action);
+
+    if (strcmp(action, "REPLACE_ALL") == 0) {
+      climateScheduleCount = 0; 
+      JsonArray schedules = doc["schedules"].as<JsonArray>();
+      for (JsonObject s : schedules) {
+        parseAndAddSchedule(s);
+      }
+      triggerLcdNotification("Jadwal Di-Sync", "Semua diperbarui");
+    } else if (strcmp(action, "UPSERT") == 0) {
+      parseAndAddSchedule(doc["schedule"].as<JsonObject>());
+      triggerLcdNotification("Jadwal Disimpan", "ID: " + String(doc["schedule"]["id"].as<int>()));
+    } else if (strcmp(action, "DELETE") == 0) {
+      deleteClimateSchedule(doc["scheduleId"].as<int>());
+      triggerLcdNotification("Jadwal Dihapus", "ID: " + String(doc["scheduleId"].as<int>()));
+    }
+  }
+  
+}
+
+void reconnectMQTT() {
+  unsigned long now = millis();
+  if (now - lastReconnectAttempt < reconnectInterval) {
+      return;
+    }
+  lastReconnectAttempt = now;
+
+  Serial.print("WiFi OK. Mencoba terhubung ke MQTT Broker...");
+  
+  if (client.connect(client_id, mqtt_user, mqtt_pass)) {
+    Serial.println("terhubung!");
+    
+    triggerLcdNotification("Koneksi Online", "MQTT Terhubung!", 2000);
+
+
+    if (client.subscribe(topicSensorDataSub)) { 
+        Serial.println("  [OK] Berhasil subscribe ke DATA SENSOR"); 
+    } else { 
+        Serial.println("  [GAGAL] Gagal subscribe ke DATA SENSOR"); 
+    }
+
+    Serial.println("Mencoba subscribe ke topik dinamis...");
+    
+    if (client.subscribe(topicClimateJadwalSet.c_str())) { Serial.println("  [OK] Berhasil subscribe ke JADWAL"); } 
+    else { Serial.println("  [GAGAL] Gagal subscribe ke JADWAL"); }
+    
+    if (client.subscribe(topicClimateSettingsSet.c_str())) { Serial.println("  [OK] Berhasil subscribe ke SETTINGS"); } 
+    else { Serial.println("  [GAGAL] Gagal subscribe ke SETTINGS"); }
+    
+    if (client.subscribe(topicClimateManualSet.c_str())) { Serial.println("  [OK] Berhasil subscribe ke MANUAL"); } 
+    else { Serial.println("  [GAGAL] Gagal subscribe ke MANUAL"); }
+    
+    if (client.subscribe(topicClimateModeSet.c_str())) { Serial.println("   [OK] Berhasil subscribe ke MODE"); } 
+    else { Serial.println("   [GAGAL] Gagal subscribe ke MODE"); }
+
+    Serial.println("Meminta sinkronisasi data...");
+    client.publish(topicClimateJadwalGet.c_str(), macAddress.c_str());
+    
+    forceLcdClear = true;
+  } else {
+    Serial.print("gagal, rc=");
+    Serial.print(client.state());
+    Serial.println(" Coba lagi nanti");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n--- [ESP32 CLIMATE CONTROL] ---");
+  Wire.begin(32, 33); 
+  lcd.init();
+  lcd.backlight();
+  lcd.print("Inisialisasi...");
+  delay(1000);
+  loadSettingsFromPreferences();
+
+  Serial.println("Mulai RTC DS1302...");
+  lcd.clear(); lcd.print("Init RTC...");
+  Rtc.Begin();
+
+  pinMode(KIPAS_1_PIN, OUTPUT);
+  pinMode(KIPAS_2_PIN, OUTPUT);
+  digitalWrite(KIPAS_1_PIN, LOW); 
+  digitalWrite(KIPAS_2_PIN, LOW); 
+  Serial.println("Pin Kipas disetup (OFF).");
+
+  WiFi.mode(WIFI_STA);
+  
+  Serial.printf("Menghubungkan ke %s... ", ssid); 
+  lcd.clear(); lcd.print("Connecting WiFi...");
+  WiFi.begin(ssid, password);
+  
+  unsigned long wifiStartTime = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - wifiStartTime < 15000)) {
+     delay(500); 
+     Serial.print("."); 
+     lcd.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+     Serial.println(" Terhubung!");
+     int actualChannel = WiFi.channel();
+     Serial.printf("===== Channel Asli WiFi: %d =====\n", actualChannel);
+     
+     Serial.println("WiFi terhubung, memaksa sinkronisasi NTP...");
+     syncRtcWithNtp();
+
+  } else {
+     Serial.println(" Gagal terhubung WiFi (Timeout). Lanjut mode offline.");
+     lcd.clear(); lcd.print("WiFi Gagal. Offline.");
+     delay(1000);
+  }
+  
+  if (WiFi.status() != WL_CONNECTED && controlMode == "manual") {
+    Serial.println("Booting Offline dalam mode Manual. Memaksa kembali ke AUTO.");
+    controlMode = "auto";
+    preferences.begin("climate-app", false);
+    preferences.putString("ctrlMode", "auto");
+    preferences.end();
+    triggerLcdNotification("Mode Offline", "Otomatis Aktif", 3000);
+  }
+
+
+  Serial.println("Inisialisasi ESP-NOW (Penerima)...");
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error inisialisasi ESP-NOW");
+    return;
+  }
+  esp_now_register_recv_cb(OnDataRecv);
+
+  byte macBytes[6];
+  WiFi.macAddress(macBytes);
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X-%02X-%02X-%02X-%02X-%02X",
+           macBytes[0], macBytes[1], macBytes[2], macBytes[3], macBytes[4], macBytes[5]);
+  macAddress = String(macStr);
+  Serial.print("MAC Address: "); Serial.println(macAddress);
+
+  topicPrefix = "ezramnd/climate/esp32/alat/" + macAddress;
+  topicClimateJadwalSet = topicPrefix + "/climate-jadwal/set";
+  topicClimateSettingsSet = topicPrefix + "/climate-settings/set";
+  topicClimateManualSet = topicPrefix + "/climate-manual/set";
+  topicClimateStatusSet = topicPrefix + "/status";
+  topicClimateModeSet = topicPrefix + "/climate-mode/set";
+  topicClimateJadwalGet = topicPrefix + "/climate-jadwal/get";
+  Serial.println("Topik dinamis dibuat.");
+
+  espClient.setInsecure(); 
+  client.setBufferSize(1024);
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(mqtt_callback); 
+
+  lastPacketTime = millis(); 
+  isConnected = false;      
+
+  lcd.clear();
+  lcd.print("Menunggu data...");
+  Serial.println("--- [SETUP SELESAI] ---");
+}
+
+void loop() {
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    unsigned long now = millis();
+    if (now - lastWifiReconnectAttempt > wifiReconnectInterval) {
+      Serial.println("WiFi terputus. Mencoba koneksi ulang...");
+      WiFi.begin(ssid, password);
+      lastWifiReconnectAttempt = now;
+    }
+  } else {
+    client.loop(); 
+    if (!client.connected()) {
+      reconnectMQTT(); 
+    }
+    if (millis() - lastNtpSync > ntpSyncInterval) {
+      syncRtcWithNtp();
+    }
+  }
+
+  if (controlMode == "auto") {
+      checkScheduleTimers(); 
+      checkSchedules();       
+  }
+  
+  if ( (millis() - lastPacketTime > timeoutDuration) && (isConnected == true) ) {
+    Serial.println("Koneksi sensor terputus! (Timeout)");
+    isConnected = false;
+    forceLcdClear = true; 
+    
+    if (!kipas1_on_by_schedule) setKipasState(1, false);
+    if (!kipas2_on_by_schedule) setKipasState(2, false);
+  }
+
+  if (isConnected && temp_diterima != 0.0) { 
+    if (controlMode == "auto") {
+      checkThresholds(); 
+    }
+  }
+
+  if (millis() - lastLcdUpdateTime > lcdUpdateInterval) {
+    lastLcdUpdateTime = millis(); 
+    
+    if (isNotifActive) {
+      if (millis() < notifEndTime) {
+        if (forceLcdClear) {
+            lcd.clear();
+            forceLcdClear = false;
+            lcd.setCursor(0, 1); lcd.print(notifLine1);
+            lcd.setCursor(0, 2); lcd.print(notifLine2);
+        }
+      } else {
+        isNotifActive = false; forceLcdClear = true; screenChangeCounter = 0; displayMode = 0;
+      }
+    } 
+    else
+    {
+      screenChangeCounter++; 
+      if (screenChangeCounter >= screenChangeInterval) {
+        displayMode = (displayMode + 1) % 2; 
+        screenChangeCounter = 0; 
+        forceLcdClear = true; 
+      }
+
+      if (forceLcdClear) {
+        lcd.clear();
+        forceLcdClear = false;
+      }
+      
+      char buf[21]; 
+      switch (displayMode) {
+        case 0:
+        {
+            if (isConnected) {
+               snprintf(buf, 21, "Suhu:       %6.2f C", temp_diterima);
+            } else {
+               snprintf(buf, 21, "Suhu:       --.--  C");
+            }
+            lcd.setCursor(0, 0); lcd.print(buf);
+
+            if (isConnected) {
+               snprintf(buf, 21, "Kelembaban: %6.2f %%", hum_diterima);
+            } else {
+               snprintf(buf, 21, "Kelembaban: --.-- %%");
+            }
+            lcd.setCursor(0, 1); lcd.print(buf);
+            
+            String statusK1;
+            if (controlMode == "manual") { statusK1 = kipas1_State ? "ON (Manual)" : "OFF (Manual)"; }
+            else if (kipas1_on_by_schedule) { statusK1 = "ON (JADWAL)"; }
+            else { statusK1 = kipas1_State ? "ON (Suhu)" : "OFF (Suhu)"; }
+            snprintf(buf, 21, "Kipas 1: %-12s", statusK1.c_str());
+            lcd.setCursor(0, 2); lcd.print(buf);
+
+            String statusK2;
+            if (controlMode == "manual") { statusK2 = kipas2_State ? "ON (Manual)" : "OFF (Manual)"; }
+            else if (kipas2_on_by_schedule) { statusK2 = "ON (JADWAL)"; }
+            else { statusK2 = kipas2_State ? "ON (Suhu)" : "OFF (Suhu)"; }
+            snprintf(buf, 21, "Kipas 2: %-12s", statusK2.c_str());
+            lcd.setCursor(0, 3); lcd.print(buf);
+            break;
+        }
+        case 1:
+        { 
+            RtcDateTime now = Rtc.GetDateTime(); 
+            snprintf(buf, 21, "%02u/%02u/%04u  %02u:%02u:%02u", 
+                          now.Day(), now.Month(), now.Year(), 
+                          now.Hour(), now.Minute(), now.Second());
+            lcd.setCursor(0, 0); lcd.print(buf);
+            
+            String statusOnline = "OFFLINE"; 
+            if (WiFi.status() == WL_CONNECTED) {
+              statusOnline = client.connected() ? "ONLINE" : "NO-MQTT";
+            }
+            snprintf(buf, 21, "Mode: %-7s %-7s", controlMode.c_str(), statusOnline.c_str());
+            lcd.setCursor(0, 1); lcd.print(buf);
+
+            snprintf(buf, 21, "K1 Set: %.1f - %.1f C", climateSettings.kipas1_min, climateSettings.kipas1_max);
+            lcd.setCursor(0, 2); lcd.print(buf);
+            snprintf(buf, 21, "K2 Set: %.1f - %.1f C", climateSettings.kipas2_min, climateSettings.kipas2_max);
+            lcd.setCursor(0, 3); lcd.print(buf);
+            break; 
+        } 
+      }
+    }
+  }
+
+  if (WiFi.status() == WL_CONNECTED && client.connected() && temp_diterima != 0.0) {
+    
+    unsigned long now = millis();
+    if (now - lastDataPublish > dataPublishInterval) {
+      lastDataPublish = now;
+
+      StaticJsonDocument<256> doc; 
+      
+      doc["suhu"] = temp_diterima;
+      doc["kelembaban"] = hum_diterima;
+
+      doc["kipas1"] = kipas1_State ? "ON" : "OFF";
+      doc["kipas2"] = kipas2_State ? "ON" : "OFF";
+
+      char jsonBuffer[256];
+      serializeJson(doc, jsonBuffer);
+
+      String dataTopic = topicPrefix + "/data";
+      
+      if (client.publish(dataTopic.c_str(), jsonBuffer)) {
+        Serial.print(">> [MQTT] Data Lengkap Terkirim: ");
+        Serial.println(jsonBuffer);
+      } else {
+        Serial.println(">> [MQTT] Gagal Publish Data");
+      }
+    }
+  } 
+  
+}
