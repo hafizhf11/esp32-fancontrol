@@ -1,0 +1,201 @@
+#include <WiFi.h>
+#include <PubSubClient.h> 
+#include <Wire.h>
+#include <Adafruit_SHT31.h>
+#include <ArduinoJson.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+
+const char* ssid = "NAMA_WIFI_ANDA"; 
+const char* password = "PASSWAORD_WIFI_ANDA"; 
+
+const char* mqtt_server = "MQTT_SERVER_ANDA"; 
+const int mqtt_port = 1883; 
+const char* client_id = "esp32_pengirim_sht30"; 
+const char* mqtt_user = "USERNAME_MQTT"; 
+const char* mqtt_pass = "PASSWORD_MQTT"; 
+
+#define EMERGENCY_CHANNEL 1
+
+
+String macAddress;
+String dataTopic;
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+Adafruit_SHT31 sht30 = Adafruit_SHT31();
+
+unsigned long previousMillis = 0; 
+const long interval = 10000; // 10 detik
+unsigned long lastReconnectAttempt_pengirim = 0;
+const unsigned long reconnectInterval_pengirim = 5000;
+
+uint8_t macPenerima[] = {0x94, 0x3C, 0xC6, 0x4E, 0x66, 0xE4}; // Pastikan MAC ini 100% benar
+
+typedef struct struct_message {
+  float suhu;
+  float kelembaban;
+} struct_message;
+
+struct_message dataSensorESP_NOW;
+
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("\r\nStatus Pengiriman ESP-NOW: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Sukses" : "Gagal");
+}
+
+void reconnectMQTT() {
+  unsigned long now = millis();
+  if (now - lastReconnectAttempt_pengirim < reconnectInterval_pengirim) {
+    return; // Belum waktunya, keluar
+  }
+  lastReconnectAttempt_pengirim = now;
+
+  Serial.print("Mencoba terhubung ke MQTT Broker...");
+  
+  if (client.connect(client_id, mqtt_user, mqtt_pass)) {
+    Serial.println("terhubung!");
+  } else {
+    Serial.print("gagal, rc=");
+    Serial.print(client.state());
+    Serial.println(" Coba lagi nanti");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+
+  if (!sht30.begin(0x44)) {
+    Serial.println("Gagal menemukan SHT30! Cek kabel.");
+    while (1) delay(1);
+  }
+  Serial.println("SHT30 Ditemukan!");
+
+  WiFi.mode(WIFI_STA); 
+  Serial.printf("Menghubungkan ke %s... ", ssid);
+  WiFi.begin(ssid, password);
+
+  unsigned long wifiStartTime = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - wifiStartTime < 30000)) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\n\nGagal terhubung WiFi (Timeout 30d). Restart...");
+    delay(1000);
+    ESP.restart();
+  }
+
+  Serial.println(" Terhubung!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  int actualChannel = WiFi.channel();
+  Serial.printf("===== Channel Asli WiFi: %d =====\n", actualChannel);
+
+  if (esp_wifi_set_channel(actualChannel, WIFI_SECOND_CHAN_NONE) != ESP_OK) {
+      Serial.println("Error mengatur channel WiFi untuk ESP-NOW");
+  }
+
+  Serial.println("Inisialisasi ESP-NOW...");
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error inisialisasi ESP-NOW");
+    return;
+  }
+
+  esp_now_register_send_cb(OnDataSent);
+
+  esp_now_peer_info_t peerInfo;
+  memset(&peerInfo, 0, sizeof(peerInfo)); 
+  memcpy(peerInfo.peer_addr, macPenerima, 6);
+  peerInfo.channel = actualChannel; 
+  peerInfo.encrypt = false;
+  
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+    Serial.println("Gagal menambahkan peer ESP-NOW");
+    return;
+  }
+  Serial.println("Peer ESP-NOW berhasil ditambahkan.");
+
+  String macAddressPenerima = "94-3C-C6-4E-66-E4"; 
+  dataTopic = "ezramnd/climate/esp32/alat/" + macAddressPenerima + "/data";
+
+  Serial.print("MAC Address Pengirim (Lokal): "); 
+  Serial.println(WiFi.macAddress()); 
+  Serial.print("Akan mem-publish MQTT ke: "); 
+  Serial.println(dataTopic);
+
+  client.setBufferSize(256); 
+  client.setServer(mqtt_server, mqtt_port);
+}
+
+void loop() {
+  // Cek koneksi (Sudah non-blocking)
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!client.connected()) {
+      reconnectMQTT();
+    }
+    client.loop(); 
+  } else {
+    // Jika WiFi tiba-tiba putus di tengah jalan, coba sambung ulang
+    // (Ini akan memicu restart jika gagal terlalu lama)
+    Serial.println("Koneksi WiFi di loop() terputus. Mencoba sambung...");
+    WiFi.begin(ssid, password);
+    unsigned long wifiStartTime = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - wifiStartTime < 30000)) {
+       delay(500);
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("Gagal sambung ulang WiFi. Restart...");
+      ESP.restart();
+    }
+  }
+
+
+  unsigned long currentMillis = millis();
+
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+
+    float temp = sht30.readTemperature();
+    float hum = sht30.readHumidity();
+
+    StaticJsonDocument<128> doc;
+    char jsonBuffer[128];
+
+    if (isnan(temp) || isnan(hum)) {
+      Serial.println("Gagal membaca SHT30. Mengirim nilai error...");
+      
+      dataSensorESP_NOW.suhu = -999.0;
+      dataSensorESP_NOW.kelembaban = -999.0;
+      
+      doc["suhu"] = -999.0;
+      doc["kelembaban"] = -999.0;
+      doc["error"] = "Sensor Read Fail";
+
+    } else {
+      dataSensorESP_NOW.suhu = temp;
+      dataSensorESP_NOW.kelembaban = hum;
+
+      doc["suhu"] = (float)temp;
+      doc["kelembaban"] = (float)hum;
+    }
+
+    if (client.connected()) {
+      serializeJson(doc, jsonBuffer);
+      client.publish(dataTopic.c_str(), jsonBuffer);
+      Serial.print("[MQTT] Terkirim: "); 
+      Serial.println(jsonBuffer);
+    }
+
+    esp_err_t result = esp_now_send(macPenerima, (uint8_t *) &dataSensorESP_NOW, sizeof(dataSensorESP_NOW));
+    
+    if (result == ESP_OK) {
+      Serial.println("[ESP-NOW] Terkirim dengan sukses");
+    } else {
+      Serial.println("[ESP-NOW] Gagal mengirim data");
+    }
+  }
+}
