@@ -12,8 +12,8 @@
 #include <Preferences.h>
 
 
-const char* ssid = "Rumah Kebun"; 
-const char* password = "Agrifam2024"; 
+const char* ssid = "SSID_WIFI"; 
+const char* password = "PASSWORD_WIFI"; 
 
 const char* ntpServer = "pool.ntp.org";
 const long  gmtOffset_sec = 7 * 3600; 
@@ -27,11 +27,11 @@ LiquidCrystal_I2C lcd(0x27, 20, 4);
 const char* mqtt_server = "broker.avisha.id"; 
 const int   mqtt_port = 8883;
 const char* client_id = "esp32_penerima_lcd"; 
-const char* mqtt_user = "ezramnd";  
-const char* mqtt_pass = "kqvUj@FRXw2lKFU"; 
+const char* mqtt_user = "USERNAME_MQTT";  
+const char* mqtt_pass = "PASSWORD_MQTT"; 
 
-const char* topic_sync_request = "ezramnd/sync/request";
-const char* topicSensorDataSub = "ezramnd/climate/esp32/alat/94-3C-C6-4E-66-E4/data";
+const char* topic_sync_request = "USERNAME_MQTT/sync/request";
+const char* topicSensorDataSub = "USERNAME_MQTT/climate/esp32/alat/94-3C-C6-4E-66-E4/data";
 
 String macAddress;
 String topicPrefix;
@@ -655,7 +655,7 @@ void setup() {
   macAddress = String(macStr);
   Serial.print("MAC Address: "); Serial.println(macAddress);
 
-  topicPrefix = "ezramnd/climate/esp32/alat/" + macAddress;
+  topicPrefix = "USERNAME_MQTT/climate/esp32/alat/" + macAddress;
   topicClimateJadwalSet = topicPrefix + "/climate-jadwal/set";
   topicClimateSettingsSet = topicPrefix + "/climate-settings/set";
   topicClimateManualSet = topicPrefix + "/climate-manual/set";
