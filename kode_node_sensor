@@ -6,10 +6,10 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 
-const char* ssid = "NAMA_WIFI_ANDA"; 
-const char* password = "PASSWAORD_WIFI_ANDA"; 
+const char* ssid = "SSID_WIFI"; 
+const char* password = "PASSWORD WIFI"; 
 
-const char* mqtt_server = "MQTT_SERVER_ANDA"; 
+const char* mqtt_server = "103.127.97.247"; 
 const int mqtt_port = 1883; 
 const char* client_id = "esp32_pengirim_sht30"; 
 const char* mqtt_user = "USERNAME_MQTT"; 
@@ -26,11 +26,11 @@ PubSubClient client(espClient);
 Adafruit_SHT31 sht30 = Adafruit_SHT31();
 
 unsigned long previousMillis = 0; 
-const long interval = 10000; // 10 detik
+const long interval = 10000;
 unsigned long lastReconnectAttempt_pengirim = 0;
 const unsigned long reconnectInterval_pengirim = 5000;
 
-uint8_t macPenerima[] = {0x94, 0x3C, 0xC6, 0x4E, 0x66, 0xE4}; // Pastikan MAC ini 100% benar
+uint8_t macPenerima[] = {0x94, 0x3C, 0xC6, 0x4E, 0x66, 0xE4};
 
 typedef struct struct_message {
   float suhu;
@@ -45,9 +45,10 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 }
 
 void reconnectMQTT() {
+  
   unsigned long now = millis();
   if (now - lastReconnectAttempt_pengirim < reconnectInterval_pengirim) {
-    return; // Belum waktunya, keluar
+    return;
   }
   lastReconnectAttempt_pengirim = now;
 
@@ -120,7 +121,7 @@ void setup() {
   Serial.println("Peer ESP-NOW berhasil ditambahkan.");
 
   String macAddressPenerima = "94-3C-C6-4E-66-E4"; 
-  dataTopic = "ezramnd/climate/esp32/alat/" + macAddressPenerima + "/data";
+  dataTopic = "USERNAME_MQTT/climate/esp32/alat/" + macAddressPenerima + "/data";
 
   Serial.print("MAC Address Pengirim (Lokal): "); 
   Serial.println(WiFi.macAddress()); 
@@ -132,15 +133,12 @@ void setup() {
 }
 
 void loop() {
-  // Cek koneksi (Sudah non-blocking)
   if (WiFi.status() == WL_CONNECTED) {
     if (!client.connected()) {
       reconnectMQTT();
     }
     client.loop(); 
   } else {
-    // Jika WiFi tiba-tiba putus di tengah jalan, coba sambung ulang
-    // (Ini akan memicu restart jika gagal terlalu lama)
     Serial.println("Koneksi WiFi di loop() terputus. Mencoba sambung...");
     WiFi.begin(ssid, password);
     unsigned long wifiStartTime = millis();
