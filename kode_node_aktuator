@@ -7,8 +7,6 @@
 #include <ThreeWire.h>
 #include <RtcDS1302.h>
 #include <ArduinoJson.h>
-#include <esp_now.h>
-#include <esp_wifi.h>
 #include <Preferences.h>
 
 
@@ -118,29 +116,6 @@ struct_message dataSensorMasuk;
 
 unsigned long lastDataPublish = 0;
 const unsigned long dataPublishInterval = 10000;
-
-void OnDataRecv(const esp_now_recv_info* recv_info, const uint8_t *incomingData, int len) {
-  memcpy(&dataSensorMasuk, incomingData, sizeof(dataSensorMasuk));
-  lastPacketTime = millis();
-
-  if (dataSensorMasuk.suhu <= -998.0) {
-    Serial.println("Menerima KODE ERROR SENSOR dari Pengirim!");
-    isConnected = true;
-    temp_diterima = 0.0;
-    hum_diterima = 0.0;
-    
-    triggerLcdNotification("SENSOR BERMASALAH!", "Cek ESP Pengirim", 5000);
-    forceLcdClear = true;
-    
-    if (!kipas1_on_by_schedule) setKipasState(1, false);
-    if (!kipas2_on_by_schedule) setKipasState(2, false);
-
-  } else {
-    temp_diterima = dataSensorMasuk.suhu;
-    hum_diterima = dataSensorMasuk.kelembaban;
-    isConnected = true; 
-  }
-}
 
 void triggerLcdNotification(String line1, String line2, int duration = 2000);
 
@@ -638,14 +613,6 @@ void setup() {
     preferences.end();
     triggerLcdNotification("Mode Offline", "Otomatis Aktif", 3000);
   }
-
-
-  Serial.println("Inisialisasi ESP-NOW (Penerima)...");
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("Error inisialisasi ESP-NOW");
-    return;
-  }
-  esp_now_register_recv_cb(OnDataRecv);
 
   byte macBytes[6];
   WiFi.macAddress(macBytes);
